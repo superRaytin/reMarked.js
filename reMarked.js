@@ -1,8 +1,8 @@
 /**
-* Copyright (c) 2012, Leon Sorokin
+* Copyright (c) 2013, Leon Sorokin
 * All rights reserved. (MIT Licensed)
 *
-* reMarked.js - DOM > markdown
+* reMarked.js - HTML > markdown
 */
 
 reMarked = function(opts) {
@@ -13,9 +13,9 @@ reMarked = function(opts) {
 	//  link_near:					// cite links immediately after blocks
 		h1_setext:	true,			// underline h1 headers
 		h2_setext:	true,			// underline h2 headers
-		h_atx_suf:	false,			// header suffix (###)
+		h_atx_suf:	false,			// header suffixes (###)
 	//	h_compact:	true,			// compact headers (except h1)
-		gfm_code:	false,			// render code blocks as via ``` delims
+		gfm_code:	false,			// gfm code blocks (```)
 		li_bullet:	"*-+"[0],		// list item bullet style
 	//	list_indnt:					// indent top-level lists
 		hr_char:	"-_*"[0],		// hr style
@@ -27,6 +27,26 @@ reMarked = function(opts) {
 		tbl_edges:	false,			// show side edges on tables
 		hash_lnks:	false,			// anchors w/hash hrefs as links
 		br_only:	false,			// avoid using "  " as line break indicator
+		col_pre:	"col ",			// column prefix to use when creating missing headers for tables
+	//	comp_style: false,			// use getComputedStyle instead of hardcoded tag list to discern block/inline
+		unsup_tags: {				// handling of unsupported tags, defined in terms of desired output style. if not listed, output = outerHTML
+			// no output
+			ignore: "script style noscript",
+			// eg: "<tag>some content</tag>"
+			inline: "span sup sub i u b center big",
+			// eg: "\n<tag>\n\tsome content\n</tag>"
+		//	block1: "",
+			// eg: "\n\n<tag>\n\tsome content\n</tag>"
+			block2: "div form fieldset dl header footer address article aside figure hgroup section",
+			// eg: "\n<tag>some content</tag>"
+			block1c: "dt dd caption legend figcaption output",
+			// eg: "\n\n<tag>some content</tag>"
+			block2c: "canvas audio video iframe",
+		},
+		tag_remap: {				// remap of variants or deprecated tags to internal classes
+			"i": "em",
+			"b": "strong"
+		}
 	};
 
 	extend(cfg, opts);
@@ -34,9 +54,15 @@ reMarked = function(opts) {
 	function extend(a, b) {
 		if (!b) return a;
 		for (var i in a) {
-			if (typeof b[i] !== "undefined")
+			if (typeOf(b[i]) == "Object")
+				extend(a[i], b[i]);
+			else if (typeof b[i] !== "undefined")
 				a[i] = b[i];
 		}
+	}
+
+	function typeOf(val) {
+		return Object.prototype.toString.call(val).slice(8,-1);
 	}
 
 	function rep(str, num) {
@@ -62,9 +88,17 @@ reMarked = function(opts) {
 		return targ + rep(padStr, len - targ.length);
 	}
 
-	function otag(tag) {
+	function otag(tag, e) {
 		if (!tag) return "";
-		return "<" + tag + ">";
+
+		var buf = "<" + tag;
+
+		for (var attr, i = 0; i < e.attributes.length; i++) {
+			attr = e.attributes.item(i);
+			buf += " " + attr.nodeName + '="' + attr.nodeValue + '"';
+		}
+
+		return buf + ">";
 	}
 
 	function ctag(tag) {
@@ -96,7 +130,22 @@ reMarked = function(opts) {
 		return pre + str + suf;
 	}
 
+	// http://stackoverflow.com/a/3819589/973988
+	function outerHTML(node) {
+		// if IE, Chrome take the internal method otherwise build one
+		return node.outerHTML || (
+		  function(n){
+			  var div = document.createElement('div'), h;
+			  div.appendChild( n.cloneNode(true) );
+			  h = div.innerHTML;
+			  div = null;
+			  return h;
+		  })(node);
+	}
+
 	this.render = function(ctr) {
+		links = [];
+
 		if (typeof ctr == "string") {
 			var htmlstr = ctr;
 			ctr = document.createElement("div");
@@ -104,21 +153,21 @@ reMarked = function(opts) {
 		}
 		var s = new lib.tag(ctr, null, 0);
 		var re = s.rend().replace(/^[\t ]+\n/gm, "\n");
-		if (cfg.link_list) {
+		if (cfg.link_list && links.length > 0) {
 			// hack
 			re += "\n\n";
 			var maxlen = 0;
 			// get longest link href with title, TODO: use getAttribute?
-			for (var y in links) {
+			for (var y = 0; y < links.length; y++) {
 				if (!links[y].e.title) continue;
 				var len = links[y].e.href.length;
 				if (len && len > maxlen)
 					maxlen = len;
 			}
 
-			for (var k in links) {
+			for (var k = 0; k < links.length; k++) {
 				var title = links[k].e.title ? rep(" ", (maxlen + 2) - links[k].e.href.length) + '"' + links[k].e.title + '"' : "";
-				re += "  [" + (+k+1) + "]: " + links[k].e.href + title + "\n";
+				re += "  [" + (+k+1) + "]: " + (nodeName(links[k].e) == "a" ? links[k].e.href : links[k].e.src) + title + "\n";
 			}
 		}
 
@@ -147,15 +196,48 @@ reMarked = function(opts) {
 			var i;
 			if (this.e.hasChildNodes()) {
 				// inline elems allowing adjacent whitespace text nodes to be rendered
-				var inlRe = /^(?:a|strong|code|em|sub|sup|del|i|u|b|big|center)$/, n, name;
+				var inlRe = cfg.unsup_tags.inline, n, name;
+
+				// if no thead exists, detect header rows or make fake cols
+				if (nodeName(this.e) == "table") {
+					if (this.e.hasChildNodes() && !this.e.tHead) {
+						var thead = document.createElement("thead");
+
+						var tbody0 = this.e.tBodies[0],
+							row0 = tbody0.rows[0],
+							cell0 = row0.cells[0];
+
+						if (nodeName(cell0) == "th")
+							thead.appendChild(row0);
+						else {
+							var hcell,
+								i = 0,
+								len = row0.cells.length,
+								hrow = thead.insertRow();
+
+							while (i++ < len) {
+								hcell = document.createElement("th");
+								hcell.textContent = cfg.col_pre + i;
+								hrow.appendChild(hcell);
+							}
+						}
+
+						this.e.insertBefore(thead, tbody0);
+					}
+				}
+
 				for (i in this.e.childNodes) {
 					if (!/\d+/.test(i)) continue;
 
 					n = this.e.childNodes[i];
 					name = nodeName(n);
 
+					// remap of variants
+					if (name in cfg.tag_remap)
+						name = cfg.tag_remap[name];
+
 					// ignored tags
-					if (/style|script|canvas|video|audio/.test(name))
+					if (cfg.unsup_tags.ignore.test(name))
 						continue;
 
 					// empty whitespace handling
@@ -170,10 +252,30 @@ reMarked = function(opts) {
 						if (prev && !nodeName(prev).match(inlRe) || next && !nodeName(next).match(inlRe))
 							continue;
 					}
-					if (!lib[name])
-						name = "tag";
+
+					var wrap = null;
+
+					if (!lib[name]) {
+						var unsup = cfg.unsup_tags;
+
+						if (unsup.inline.test(name))
+							name = "tinl";
+						else if (unsup.block2.test(name))
+							name = "tblk";
+						else if (unsup.block1c.test(name))
+							name = "ctblk";
+						else if (unsup.block2c.test(name)) {
+							name = "ctblk";
+							wrap = ["\n\n", ""];
+						}
+						else
+							name = "rawhtml";
+					}
 
 					var node = new lib[name](n, this, this.c.length);
+
+					if (wrap)
+						node.wrap = wrap;
 
 					if (node instanceof lib.a && n.href || node instanceof lib.img) {
 						node.lnkid = links.length;
@@ -193,7 +295,7 @@ reMarked = function(opts) {
 		rendK: function()
 		{
 			var n, buf = "";
-			for (var i in this.c) {
+			for (var i = 0; i < this.c.length; i++) {
 				n = this.c[i];
 				buf += (n.bef || "") + n.rend() + (n.aft || "");
 			}
@@ -228,7 +330,7 @@ reMarked = function(opts) {
 
 		rend: function()
 		{
-			return wrap.call(this, (this.tagr ? otag(this.tag) : "") + wrap.call(this, pfxLines(pfxLines(this.rendK(), this.lnPfx), rep(" ", this.lnInd)), this.wrapK) + (this.tagr ? ctag(this.tag) : ""), this.wrap);
+			return wrap.call(this, (this.tagr ? otag(this.tag, this.e) : "") + wrap.call(this, pfxLines(pfxLines(this.rendK(), this.lnPfx), rep(" ", this.lnInd)), this.wrapK) + (this.tagr ? ctag(this.tag) : ""), this.wrap);
 		},
 
 		rendK: function()
@@ -238,7 +340,7 @@ reMarked = function(opts) {
 			if (this.p instanceof lib.li) {
 				var repl = null, spcs = kids.match(/^[\t ]+/gm);
 				if (!spcs) return kids;
-				for (var i in spcs) {
+				for (var i = 0; i < spcs.length; i++) {
 					if (repl === null || spcs[i][0].length < repl.length)
 						repl = spcs[i][0];
 				}
@@ -251,6 +353,7 @@ reMarked = function(opts) {
 	lib.tblk = lib.blk.extend({tagr: true});
 
 	lib.cblk = lib.blk.extend({wrap: ["\n", ""]});
+
 		lib.ctblk = lib.cblk.extend({tagr: true});
 
 	lib.inl = lib.tag.extend({
@@ -264,7 +367,7 @@ reMarked = function(opts) {
 			tagr: true,
 			rend: function()
 			{
-				return otag(this.tag) + wrap.call(this, this.rendK(), this.wrap) + ctag(this.tag);
+				return otag(this.tag, this.e) + wrap.call(this, this.rendK(), this.wrap) + ctag(this.tag);
 			}
 		});
 
@@ -273,10 +376,6 @@ reMarked = function(opts) {
 				return this.supr().replace(/^\s+/gm, "");
 			}
 		});
-
-		lib.div = lib.p.extend();
-
-		lib.span = lib.inl.extend();
 
 		lib.list = lib.blk.extend({
 			expn: false,
@@ -366,7 +465,7 @@ reMarked = function(opts) {
 					src = this.e.getAttribute("src");
 
 				if (cfg.link_list)
-					return "[" + kids + "] [" + (this.lnkid + 1) + "]";
+					return "![" + kids + "] [" + (this.lnkid + 1) + "]";
 
 				var title = this.e.title ? ' "'+ this.e.title + '"' : "";
 
@@ -376,8 +475,6 @@ reMarked = function(opts) {
 
 
 		lib.em = lib.inl.extend({wrap: cfg.emph_char});
-
-			lib.i = lib.em.extend();
 
 		lib.del = cfg.gfm_del ? lib.inl.extend({wrap: "~~"}) : lib.tinl.extend();
 
@@ -390,18 +487,6 @@ reMarked = function(opts) {
 		});
 
 		lib.strong = lib.inl.extend({wrap: rep(cfg.bold_char, 2)});
-
-			lib.b = lib.strong.extend();
-
-		lib.dl = lib.tblk.extend({lnInd: 2});
-
-		lib.dt = lib.ctblk.extend();
-
-		lib.dd = lib.ctblk.extend();
-
-		lib.sub = lib.tinl.extend();
-
-		lib.sup = lib.tinl.extend();
 
 		lib.blockquote = lib.blk.extend({
 			lnPfx: "> ",
@@ -456,9 +541,9 @@ reMarked = function(opts) {
 			},
 			rend: function() {
 				// run prep on all cells to get max col widths
-				for (var tsec in this.c)
-					for (var row in this.c[tsec].c)
-						for (var cell in this.c[tsec].c[row].c)
+				for (var tsec = 0; tsec < this.c.length; tsec++)
+					for (var row = 0; row < this.c[tsec].c.length; row++)
+						for (var cell = 0; cell < this.c[tsec].c[row].c.length; cell++)
 							this.c[tsec].c[row].c[cell].prep();
 
 				return this.supr();
@@ -468,7 +553,7 @@ reMarked = function(opts) {
 		lib.thead = cfg.gfm_tbls ? lib.cblk.extend({
 			wrap: ["\n", function(kids) {
 				var buf = "";
-				for (var i in this.p.cols) {
+				for (var i = 0; i < this.p.cols.length; i++) {
 					var col = this.p.cols[i],
 						al = col.a[0] == "c" ? ":" : " ",
 						ar = col.a[0] == "r" || col.a[0] == "c" ? ":" : " ";
@@ -551,9 +636,25 @@ reMarked = function(opts) {
 					kids = kids.replace(/^\n+/, "");
 				if (this.i == this.p.c.length - 1)
 					kids = kids.replace(/\n+$/, "");
+
 				return kids;
 			}
 		});
+
+		lib.rawhtml = lib.blk.extend({
+			initK: function()
+			{
+				this.guts = outerHTML(this.e);
+			},
+			rendK: function()
+			{
+				return this.guts;
+			}
+		});
+
+		// compile regexes
+		for (var i in cfg.unsup_tags)
+			cfg.unsup_tags[i] = new RegExp("^(?:" + (i == "inline" ? "a|em|strong|img|code|del|" : "") + cfg.unsup_tags[i].replace(/\s/g, "|") + ")$");
 };
 
 /*!
